@@ -1,12 +1,11 @@
 import pandas as pd
 import numpy as np
-from ahrs.filters import Madgwick
+import math
+from scipy.signal import butter, filtfilt
+from scipy.spatial import cKDTree
+from ahrs.filters import EKF
 from ahrs import Quaternion
 from ahrs.common.orientation import acc2q
-from scipy.signal import butter, filtfilt
-import math
-from scipy.spatial import cKDTree
-
 
 def load_and_preprocess_imu(file_path):
     print("1. Завантаження даних IMU...")
@@ -29,15 +28,13 @@ def load_and_preprocess_imu(file_path):
     stat_mask = df_merged['TimeSec'] <= 2.0
     gyr_bias = df_merged.loc[stat_mask, ['GyrX', 'GyrY', 'GyrZ']].mean().values
     df_merged[['GyrX', 'GyrY', 'GyrZ']] -= gyr_bias
+
     print(f"   Зсув гіроскопа компенсовано: {gyr_bias}")
-
     return df_merged, start_time_us
-
 
 def process_barometer(file_path, start_time_us):
     print("-> Завантаження та обробка даних Барометра...")
     df = pd.read_csv(file_path)
-
     df = df[df['Health'] == 1]
 
     df['TimeSec'] = (df['TimeUS'] - start_time_us) / 1e6
@@ -46,27 +43,41 @@ def process_barometer(file_path, start_time_us):
     baro1 = df[df['I'] == 1].set_index('TimeSec')['Alt']
 
     merged_alt = pd.concat([baro0, baro1], axis=1, keys=['Alt0', 'Alt1']).interpolate(method='index').bfill().ffill()
-
     merged_alt['Alt_Virtual'] = merged_alt['Alt0'] * 0.75 + merged_alt['Alt1'] * 0.25
     merged_alt = merged_alt.reset_index()
 
-    print("-> Застосування LPF фільтра нульової фази до Барометра...")
     fs = 10.0
     cutoff = 1.0
     b, a = butter(2, cutoff / (0.5 * fs), btype='low')
 
     merged_alt['Alt_Smooth'] = filtfilt(b, a, merged_alt['Alt_Virtual'])
-
     base_alt = merged_alt.loc[merged_alt['TimeSec'] <= 2.0, 'Alt_Smooth'].mean()
     merged_alt['Alt_Smooth'] -= base_alt
 
-    print("-> Розрахунок вертикальної швидкості (Vz)...")
     merged_alt['VelZ_Baro'] = np.gradient(merged_alt['Alt_Smooth'], merged_alt['TimeSec'])
 
     return merged_alt[['TimeSec', 'Alt_Smooth', 'VelZ_Baro']]
 
+def process_gps(file_path, start_time_us):
+    print("-> Завантаження та обробка даних GPS...")
+    df = pd.read_csv(file_path)
+    df = df[df['Status'] >= 3].copy()
 
-def calculate_trajectory(df_merged, baro_df, k_drag=0.5):
+    df['TimeSec'] = (df['TimeUS'] - start_time_us) / 1e6
+
+    lat0 = df['Lat'].iloc[0]
+    lng0 = df['Lng'].iloc[0]
+    alt0 = df['Alt'].iloc[0]
+
+    R_earth = 6378137.0
+
+    df['x'] = (df['Lng'] - lng0) * (math.pi / 180.0) * R_earth * math.cos(lat0 * math.pi / 180.0)
+    df['y'] = (df['Lat'] - lat0) * (math.pi / 180.0) * R_earth
+    df['z'] = df['Alt'] - alt0
+
+    return df[['TimeSec', 'x', 'y', 'z']]
+
+def calculate_trajectory(df_merged, baro_df, k_drag=0.8):
     print(f"5. Підготовка масивів для обчислення траєкторії (K_drag = {k_drag})...")
     t = df_merged['TimeSec'].values
     gyr = df_merged[['GyrX', 'GyrY', 'GyrZ']].values
@@ -75,14 +86,18 @@ def calculate_trajectory(df_merged, baro_df, k_drag=0.5):
     dt = np.diff(t)
     dt = np.insert(dt, 0, dt[0])
 
-    print("6. Оцінка орієнтації (Фільтр Маджвіка)...")
-    madgwick = Madgwick(gain=0.05)
+    print("6. Оцінка орієнтації (Extended Kalman Filter)...")
+    var_gyro = 0.0025 ** 2
+    var_acc = 0.005 ** 2
+
+    ekf = EKF(noises=[var_acc, var_acc, var_acc])
     num_samples = len(t)
+
     Q = np.zeros((num_samples, 4))
     Q[0] = acc2q(acc[0])
 
     for i in range(1, num_samples):
-        Q[i] = madgwick.updateIMU(Q[i - 1], gyr[i], acc[i], dt=dt[i])
+        Q[i] = ekf.update(Q[i - 1], gyr[i], acc[i])
 
     print("7. Переведення прискорень у глобальну систему координат...")
     acc_global = np.zeros_like(acc)
@@ -125,27 +140,49 @@ def calculate_trajectory(df_merged, baro_df, k_drag=0.5):
 
     return result_df
 
+def align_trajectories(est_traj, gps_traj):
+    print("-> Вирівнювання початкового курсу (Initial Heading Alignment)...")
 
-def process_gps(file_path, start_time_us):
-    print("-> Завантаження та обробка даних GPS...")
-    df = pd.read_csv(file_path)
+    t_target = 3.0
 
-    df = df[df['Status'] >= 3].copy()
+    if gps_traj['TimeSec'].max() < t_target or est_traj['timestamp'].max() < t_target:
+        print("   Лог занадто короткий для надійного вирівнювання.")
+        return est_traj
 
-    df['TimeSec'] = (df['TimeUS'] - start_time_us) / 1e6
+    gps_start = gps_traj.iloc[0]
+    gps_t3 = gps_traj.iloc[(gps_traj['TimeSec'] - t_target).abs().argsort()[:1]].iloc[0]
 
-    lat0 = df['Lat'].iloc[0]
-    lng0 = df['Lng'].iloc[0]
-    alt0 = df['Alt'].iloc[0]
+    est_start = est_traj.iloc[0]
+    est_t3 = est_traj.iloc[(est_traj['timestamp'] - t_target).abs().argsort()[:1]].iloc[0]
 
-    R_earth = 6378137.0
+    vec_gps = np.array([gps_t3['x'] - gps_start['x'], gps_t3['y'] - gps_start['y']])
+    vec_est = np.array([est_t3['x'] - est_start['x'], est_t3['y'] - est_start['y']])
 
-    df['x'] = (df['Lng'] - lng0) * (math.pi / 180.0) * R_earth * math.cos(lat0 * math.pi / 180.0)
-    df['y'] = (df['Lat'] - lat0) * (math.pi / 180.0) * R_earth
-    df['z'] = df['Alt'] - alt0
+    angle_gps = np.arctan2(vec_gps[1], vec_gps[0])
+    angle_est = np.arctan2(vec_est[1], vec_est[0])
 
-    return df[['TimeSec', 'x', 'y', 'z']]
+    theta = angle_gps - angle_est
+    print(f"   Корекція курсу: {np.degrees(theta):.2f} градусів")
 
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([
+        [cos_t, -sin_t],
+        [sin_t, cos_t]
+    ])
+
+    xy_est = est_traj[['x', 'y']].values
+    xy_rotated = xy_est @ rotation_matrix.T
+
+    aligned_traj = est_traj.copy()
+    aligned_traj['x'] = xy_rotated[:, 0]
+    aligned_traj['y'] = xy_rotated[:, 1]
+
+    vel_est = est_traj[['speed_x', 'speed_y']].values
+    vel_rotated = vel_est @ rotation_matrix.T
+    aligned_traj['speed_x'] = vel_rotated[:, 0]
+    aligned_traj['speed_y'] = vel_rotated[:, 1]
+
+    return aligned_traj
 
 def calculate_errors(estimated_traj, gps_traj):
     print("\n--- Оцінка точності (Metrics) ---")
@@ -163,7 +200,6 @@ def calculate_errors(estimated_traj, gps_traj):
     gps_tree = cKDTree(gps_points)
 
     distances, indices = gps_tree.query(est_points)
-
     rms_error = np.sqrt(np.mean(distances ** 2))
 
     print(f"2. RMS Crosstrack Error: {rms_error:.2f} метрів")
@@ -177,25 +213,20 @@ def calculate_errors(estimated_traj, gps_traj):
         'Max_Error': max_error
     }
 
-
 if __name__ == "__main__":
     imu_file_path = 'IMU.csv'
     baro_file_path = 'BARO.csv'
     gps_file_path = 'GPS.csv'
 
     clean_imu_data, start_time_us = load_and_preprocess_imu(imu_file_path)
-
     clean_baro_data = process_barometer(baro_file_path, start_time_us)
-
-    trajectory = calculate_trajectory(clean_imu_data, clean_baro_data, k_drag=1)
-
     gps_trajectory = process_gps(gps_file_path, start_time_us)
 
-    errors = calculate_errors(trajectory, gps_trajectory)
+    estimated_trajectory = calculate_trajectory(clean_imu_data, clean_baro_data, k_drag=0.8)
 
-    trajectory.to_csv('Trajectory_Output.csv', index=False)
+    aligned_trajectory = align_trajectories(estimated_trajectory, gps_trajectory)
 
-    print("\nПерші 5 точок траєкторії:")
-    print(trajectory[['timestamp', 'x', 'y', 'z']].head())
-    print("\nОстанні 5 точок траєкторії:")
-    print(trajectory[['timestamp', 'x', 'y', 'z']].tail())
+    errors = calculate_errors(aligned_trajectory, gps_trajectory)
+
+    aligned_trajectory.to_csv('Trajectory_Estimated_Aligned.csv', index=False)
+    gps_trajectory.to_csv('Trajectory_GPS_Reference.csv', index=False)
